@@ -6,8 +6,10 @@ Dr. Morton's Code
 
 LED Display & Busser Code
 - This folder contains the code for Aden's LED display and Busser
+
 PID Controller Code
 - This folder contains the code and math for Gregs PID controller
+
 VGA Display Code
 - This folder contains the code for the VGA display port.
 
