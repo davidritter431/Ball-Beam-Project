@@ -1,0 +1,108 @@
+
+`timescale 1ns / 1ps
+
+module VGA_Dashboard_tb;
+
+    // Inputs
+    reg clk100;
+    reg reset;
+    reg sample_valid;
+    reg [15:0] distance_cm;
+    reg [15:0] target_cm;
+    reg signed [16:0] error_cm;
+    reg [31:0] pwm_command;
+
+    // Outputs
+    wire [3:0] vga_red;
+    wire [3:0] vga_green;
+    wire [3:0] vga_blue;
+    wire vga_hs;
+    wire vga_vs;
+
+    // Instantiate VGA module
+    VGA_Dashboard DUT (
+        .clk100(clk100),
+        .reset(reset),
+        .sample_valid(sample_valid),
+        .distance_cm(distance_cm),
+        .target_cm(target_cm),
+        .error_cm(error_cm),
+        .pwm_command(pwm_command),
+        .vga_red(vga_red),
+        .vga_green(vga_green),
+        .vga_blue(vga_blue),
+        .vga_hs(vga_hs),
+        .vga_vs(vga_vs)
+    );
+
+    // 100 MHz clock
+    always #5 clk100 = ~clk100;
+
+    // Generate a simulated sensor measurement
+    task send_sample;
+        input [31:0] pwm_value;
+        begin
+            distance_cm = 25;
+            target_cm = 30;
+            error_cm = 17'sd5;
+            pwm_command = pwm_value;
+
+            sample_valid = 1;
+            #10;
+            sample_valid = 0;
+
+            $display(
+                "Time=%0t | Distance=%0d cm | Target=%0d cm | Error=%0d cm | PWM=%0d",
+                $time, distance_cm, target_cm,
+                error_cm, pwm_command
+            );
+        end
+    endtask
+
+    // Simulation
+    initial begin
+
+        clk100 = 0;
+        reset = 1;
+        sample_valid = 0;
+
+        distance_cm = 0;
+        target_cm = 0;
+        error_cm = 0;
+        pwm_command = 0;
+
+        // Reset
+        #100;
+        reset = 0;
+
+        // Simulated balance beam measurements
+        #1000;
+        send_sample(45000);
+
+        #1000000;
+        send_sample(47500);
+
+        #1000000;
+        send_sample(50000);
+
+        #1000000;
+        send_sample(52500);
+
+        #1000000;
+        send_sample(55000);
+
+        #1000000;
+        send_sample(50000);
+
+        // Continue VGA operation
+        // Allow at least one complete frame
+        #17000000;
+
+        $display("================================");
+        $display("VGA TESTBENCH COMPLETED");
+        $display("================================");
+
+        $finish;
+    end
+
+endmodule
