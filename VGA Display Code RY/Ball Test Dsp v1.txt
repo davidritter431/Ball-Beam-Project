@@ -1,0 +1,538 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: UTSA
+// Engineer: Morton
+//
+// Create Date: 11/08/2024 02:33:37 PM
+// Modified: SR04 ultrasonic (Trig/Echo) replaced with TFmini-S LiDAR (UART, 115200 8N1), PD controller kept
+//////////////////////////////////////////////////////////////////////////////////
+module BBa(clk100,sw,seg,disp,PWM,lidar_rx,lidar_tx,red1,TestA2,
+vga_red_o, vga_green_o, vga_blue_o, vga_hs_o, vga_vs_o); // Added VGA ports
+input clk100;
+input [15:0] sw;
+output [7:0] seg;
+output [7:0] disp;
+output PWM;
+input lidar_rx;   //the TFmini-S TXD (Pmod JB1)
+output lidar_tx;  //the TFmini-S RXD (Pmod JB2), optional, held idle-high
+output red1;
+output TestA2;
+output [3:0] vga_red_o; // Added proceeding 5 output declarations
+output [3:0] vga_green_o;
+output [3:0] vga_blue_o;
+output vga_hs_o;
+output vga_vs_o;
+
+reg [31:0]count;
+reg [3:0] NextState;
+wire [3:0] State;
+reg [31:0] RIBuff;
+
+//////////////////////// TFmini-S Receive Variables ////////////////////////
+
+wire [7:0] rx_byte;
+wire rx_valid;
+wire [15:0] dist_cm;   // newest distance (cm) from a frame that passed the checksum
+wire frame_ok;         // 1-clock pulse: "dist_cm was just updated"
+
+reg [15:0] last_dist = 16'd0; // newest valid distance, held for the controller
+reg got_frame = 1'b0;         // 1 if a valid frame arrived since the last control update
+
+localparam [15:0] MAX_CM = 16'd1200; // anything above 12 m is treated as "no valid measurement"
+
+//////////////////////// Proportional Controller Variables////////////////
+
+reg [15:0] setpoint = 16'd30;// Setpoint in cm (desired position). Converted from the old SR04 setpoint, re-measure it with the TFmini-S
+
+localparam [31:0] PWM_NEUTRAL = 32'd153600; // This is what makes the beam is horizontal
+
+// Gains in PWM counts per cm of error.
+// The SR04 code measured error in 10 ns echo ticks (about 5800 ticks per cm),
+// so the old Kp = 1/4 is 5800/4 = 1450 and the old Kd = 1/16 is 5800/16 = 362 now.
+localparam signed [11:0] KP = 12'sd1450;
+localparam signed [11:0] KD = 12'sd362;
+
+reg signed [16:0] error = 17'sd0;//we need it to be signed in order to tell the servo if its getting further or closer
+
+reg signed [32:0] P_output = 33'sd0;//P=Kp*e
+wire signed [28:0] P_calc = error * KP; // 17 bit x 12 bit = 29 bit
+
+///////////////////Derivitive Controller Variables////////////////////////////////
+reg signed [16:0] previous_error = 17'sd0;// NEEDED for D portion
+
+wire signed [17:0] D_error = {error[16], error} - {previous_error[16], previous_error};// extra bit for sign
+
+reg signed [33:0] D_output = 34'sd0; // Stores the derivative correction
+wire signed [29:0] D_calc = D_error * KD; // 18 bit x 12 bit = 30 bit
+
+reg have_previous_error = 1'b0;// if we are starting this we wont have any errors
+
+reg measurement_ready = 1'b0;
+
+wire signed [34:0] PWM_command; // Holds neutral PWM plus P and D corrections
+
+reg [63:0] PWM_limited;
+
+
+
+// Calculate PWM using both P and D corrections
+// The correction direction must be confirmed through physical testing
+assign PWM_command = $signed({3'b000, PWM_NEUTRAL})+ P_output + D_output;
+
+// Limit the PWM command before sending it to the servo
+//(I CHATTED THIS  ALWAYS BLOCK PART BECAUSE I DIDNT KNOW HOW TO MAKE THE LIMITATIONS SINCE ITS SIGNED)
+always @(*) begin
+
+    if (PWM_command > 35'sd200000)
+        PWM_limited = 64'd200000;
+
+    else if (PWM_command < 35'sd100000)
+        PWM_limited = 64'd100000;
+
+    else
+        PWM_limited = PWM_command;
+
+end
+
+
+assign State = NextState;
+assign lidar_tx = 1'b1;     //UART idle level; sensor streams data without commands
+initial begin
+NextState <= 4'h0;
+count = 32'd0;
+RIBuff = 32'h00000000;
+end
+
+//TFmini-S receive chain
+UART_Rx #(.CLKS_PER_BIT(868)) IN101 (clk100, lidar_rx, rx_byte, rx_valid);  // 100 MHz / 115200 = 868
+TFmini_Parser IN102 (clk100, rx_byte, rx_valid, dist_cm, frame_ok);
+
+//converts the binary cm -> decimal digits for the 7-segment display
+//done one step per clock (14 clocks) so the logic depth stays small and timing is met
+wire [13:0] d = (dist_cm > 16'd9999) ? 14'd9999 : dist_cm[13:0];
+wire [15:0] bcd;
+wire bcd_done;
+Bin2BCD_Seq IN103 (clk100, frame_ok, d, bcd, bcd_done);
+
+always @(posedge clk100) begin
+    if (bcd_done) 
+        RIBuff <= {12'h000, bcd, 4'h0}; // SSEG shows BCD[19:4] on the four right digits
+end
+
+assign TestA2 = count[19];//
+PWM_Gen IN105 (clk100,PWM_limited,PWM);//Replace the concatination with the PID output
+
+//SWITCHES ARE CURRENTLY CONTROLLING THE SERVOS
+always @(posedge clk100) begin //This holds the state machine for the project tick "posedge count[19]"
+    count <= count+1;
+    case (State) // n states
+        4'h0: begin // State 0: Calculate PD corrections
+            count <= 32'h00000000;     // Reset state machine counter
+            // Only calculate controller outputs if we received a valid measurement
+            if (measurement_ready) begin
+                // PROPORTIONAL CONTROLLER
+                // P = Kp * error
+                // Kp = 1450 PWM counts per cm (same response as the old Kp = 0.25 on SR04 ticks)
+                P_output <= P_calc;
+        
+                // DERIVATIVE CONTROLLER
+                // D = Kd * (current_error - previous_error)
+                // Only calculate D if we have a previous valid error
+                if (have_previous_error)
+                    // Kd = 362 PWM counts per cm of change (same response as the old >>> 4 on SR04 ticks)
+                    D_output <= D_calc;
+                else
+                    // First valid measurement: no previous error to compare
+                    D_output <= 34'sd0;
+        
+                // Save current error for comparison with the next measurement
+                previous_error <= error;
+        
+                // Mark that we now have a previous valid error
+                have_previous_error <= 1'b1;
+            end
+            else begin // No valid TFmini-S measurement
+                // Set both corrections to zero to avoid unexpected servo movement
+                P_output <= 33'sd0;
+                D_output <= 34'sd0;
+        
+                // Reset derivative history after a missing measurement
+                have_previous_error <= 1'b0;
+            end
+        
+            // Mark this measurement as processed
+            measurement_ready <= 1'b0;
+        
+            // Move to State 1 to wait for the next control period
+            NextState <= 4'h1;
+        end
+    
+        4'h1: begin
+            // Wait out the control period (6,000,000 clocks = 60 ms, same as the old SR04 loop)
+            // The TFmini-S sends about 100 frames per second, so about 6 frames arrive while we wait
+            if (count >= 32'd6_000_000) begin
+                NextState <= 4'h2;
+            end
+        end
+        4'h2: begin
+            // Use the newest valid distance if at least one good frame arrived this period
+            if (got_frame && (last_dist != 16'd0) && (last_dist <= MAX_CM)) begin
+                error <= $signed({1'b0, setpoint}) - $signed({1'b0, last_dist});
+                measurement_ready <= 1'b1;
+            end
+            else begin
+                measurement_ready <= 1'b0;
+            end
+            got_frame <= 1'b0;
+            NextState <= 4'h0;
+        end
+    endcase
+
+    // Remember the newest valid frame (placed after the case so a frame that arrives in State 2 still counts)
+    if (frame_ok) begin
+        last_dist <= dist_cm;
+        got_frame <= 1'b1;
+    end
+end
+
+SSEG IN106 (seg,disp,clk100,RIBuff,sw);
+
+// VGA Dashboard
+VGA_Dashboard VGA1 (
+    .clk100(clk100),
+    .reset(1'b0),
+
+    // LiDAR and controller signals
+    .sample_valid(frame_ok),
+    .distance_cm(dist_cm),
+    .target_cm(setpoint),
+    .error_cm(error),
+    .pwm_command(PWM_limited[31:0]),
+
+    // VGA outputs
+    .vga_red(vga_red_o),
+    .vga_green(vga_green_o),
+    .vga_blue(vga_blue_o),
+    .vga_hs(vga_hs_o),
+    .vga_vs(vga_vs_o)
+);
+
+endmodule
+// ***********************************************************
+// Sequential binary-to-BCD (shift and add-3), no / or % needed
+// start loads bin; done pulses 14 clocks later with the result in bcd
+module Bin2BCD_Seq(clk100, start, bin, bcd, done);
+input clk100;
+input start;               // 1-clock pulse: "load bin and begin converting"
+input [13:0] bin;          // binary value to convert (0 to 9999)
+output reg [15:0] bcd;     // 4 decimal digits, 4 bits each
+output reg done;           // 1-clock pulse: "bcd holds the finished result"
+
+reg [13:0] shift_bin;      // binary bits still waiting to be shifted in
+reg [15:0] shift_bcd;      // digits being built up
+reg [3:0] cnt;             // how many bits have been processed (0 to 13)
+reg busy;                  // 1 while a conversion is running
+
+wire [15:0] adj;           // each digit that is 5 or more gets +3 before the shift
+assign adj[3:0]   = (shift_bcd[3:0]   >= 4'd5) ? shift_bcd[3:0]   + 4'd3 : shift_bcd[3:0];
+assign adj[7:4]   = (shift_bcd[7:4]   >= 4'd5) ? shift_bcd[7:4]   + 4'd3 : shift_bcd[7:4];
+assign adj[11:8]  = (shift_bcd[11:8]  >= 4'd5) ? shift_bcd[11:8]  + 4'd3 : shift_bcd[11:8];
+assign adj[15:12] = (shift_bcd[15:12] >= 4'd5) ? shift_bcd[15:12] + 4'd3 : shift_bcd[15:12];
+wire [15:0] nxt = {adj[14:0], shift_bin[13]};  // shift left and bring in the next binary bit
+
+initial begin
+    bcd = 16'd0;
+    done = 1'b0;
+    shift_bin = 14'd0;
+    shift_bcd = 16'd0;
+    cnt = 4'd0;
+    busy = 1'b0;
+end
+
+always @(posedge clk100) begin
+    done <= 1'b0;                 // default: pulse is only high for one clock
+    if (!busy) begin
+        if (start) begin          // load the value and begin
+            shift_bin <= bin;
+            shift_bcd <= 16'd0;
+            cnt <= 4'd0;
+            busy <= 1'b1;
+        end
+    end
+    else begin
+        shift_bcd <= nxt;
+        shift_bin <= {shift_bin[12:0], 1'b0};
+        cnt <= cnt + 4'd1;
+        if (cnt == 4'd13) begin   // all 14 bits processed
+            bcd <= nxt;
+            done <= 1'b1;
+            busy <= 1'b0;
+        end
+    end
+end
+endmodule
+// ***********************************************************
+// UART receiver, 8N1, LSB first
+module UART_Rx #(parameter CLKS_PER_BIT = 868) (clk100, rx, data, valid);
+input clk100;
+input rx;
+output reg [7:0] data;
+output reg valid;
+
+localparam IDLE = 2'd0, START = 2'd1, DATA = 2'd2, STOP = 2'd3;
+
+reg rx_m, rx_s;          // two-flop synchronizer
+reg [1:0]  state;
+reg [15:0] clk_cnt;
+reg [2:0]  bit_idx;
+reg [7:0]  shift;
+
+initial begin
+    rx_m = 1'b1; 
+    rx_s = 1'b1;
+    state = IDLE;
+    clk_cnt = 16'd0;
+    bit_idx = 3'd0;
+    shift = 8'h00;
+    data = 8'h00;
+    valid = 1'b0;
+end
+
+always @(posedge clk100) begin
+    rx_m <= rx;
+    rx_s <= rx_m;
+    valid <= 1'b0;
+    case (state)
+        IDLE: begin
+            if (rx_s == 1'b0) begin   // falling edge = start bit
+                clk_cnt <= 16'd0;
+                state <= START;
+            end
+        end
+        START: begin                // wait to the middle of the start bit
+            if (clk_cnt == (CLKS_PER_BIT-1)/2) begin
+                if (rx_s == 1'b0) begin
+                    clk_cnt <= 16'd0;
+                    bit_idx <= 3'd0;
+                    state <= DATA;
+                end
+                else state <= IDLE;       // glitch, not a real start bit
+            end
+            else clk_cnt <= clk_cnt + 16'd1;
+        end
+        DATA: begin                 // sample each bit at its middle
+            if (clk_cnt == CLKS_PER_BIT-1) begin
+                clk_cnt <= 16'd0;
+                shift[bit_idx] <= rx_s;
+                if (bit_idx == 3'd7) 
+                    state <= STOP;
+                else 
+                    bit_idx <= bit_idx + 3'd1;
+            end
+            else 
+                clk_cnt <= clk_cnt + 16'd1;
+            end
+        STOP: begin
+            if (clk_cnt == CLKS_PER_BIT-1) begin
+                if (rx_s == 1'b1) begin   // valid stop bit
+                    data <= shift;
+                    valid <= 1'b1;
+                end
+                state <= IDLE;
+            end
+            else 
+                clk_cnt <= clk_cnt + 16'd1;
+            end
+    endcase
+end
+endmodule
+// ***********************************************************
+// TFmini-S 9-byte frame: 59 59 DistL DistH StrL StrH TempL TempH Checksum
+// Byte 0-1: header (0x59 0x59)      
+// Byte 2-3: distance in cm (low byte first)
+// Byte 4-5: signal strength         
+// Byte 6-7: chip temperature
+// Byte 8:   checksum = low 8 bits of the sum of bytes 0 through 7
+module TFmini_Parser(clk100, data, data_valid, dist_cm, frame_ok);
+input clk100;
+input [7:0] data;          //byte  from the UART_RX
+input data_valid;          // 1-clock pulse: "data holds a new byte"
+output reg [15:0] dist_cm; // last distance from a frame that passed the checksum
+output reg frame_ok;       // 1-clock pulse: "dist_cm was just updated"
+
+reg [3:0] idx;             // which byte of the frame we expect next (0 to 8)
+reg [7:0] sum;             // running checksum; 8 bits, so it wraps on its own
+reg [7:0] dl, dh;          // distance low and high bytes held until checksum is checked
+
+initial begin
+    idx = 4'd0;
+    sum = 8'h00;
+    dl = 8'h00;
+    dh = 8'h00;
+    dist_cm = 16'd0;
+    frame_ok = 1'b0;
+end
+
+always @(posedge clk100) begin
+    frame_ok <= 1'b0;     // default: pulse is only high for one clock
+    if (data_valid) begin // only does something when a new byte arrives
+        case (idx)
+            4'd0: begin
+                if (data == 8'h59) begin 
+                    sum <= 8'h59; 
+                    idx <= 4'd1; 
+                end
+            end
+            4'd1: begin
+                if (data == 8'h59) begin
+                    sum <= sum + data; 
+                    idx <= 4'd2; 
+                end
+                else idx <= 4'd0;
+            end
+            4'd2: begin 
+                dl <= data; 
+                sum <= sum + data; 
+                idx <= 4'd3; 
+            end
+            4'd3: begin 
+                dh <= data; 
+                sum <= sum + data; 
+                idx <= 4'd4; 
+            end
+            4'd4, 4'd5, 4'd6, 4'd7: begin   // strength and temperature bytes (included in checksum, not used)
+                sum <= sum + data;
+                idx <= idx + 4'd1;
+            end
+            4'd8: begin
+                if (data == sum) begin
+                    dist_cm <= {dh, dl};
+                    frame_ok <= 1'b1;
+                end
+                idx <= 4'd0;
+            end
+            default: idx <= 4'd0;
+        endcase
+    end
+end
+endmodule
+// ***********************************************************
+module PWM_Gen(clk100, Input, PWM_Pulse);
+input clk100;
+input [63:0] Input;
+output reg PWM_Pulse;
+reg [63:0] Count;
+// reg [63:0] RInput;
+wire [63:0] RInput;
+initial begin
+Count = 0;
+PWM_Pulse = 0;
+end
+always@(posedge clk100) begin
+Count <= Count + 64'd1;
+if(Count == 64'd600_000) Count <= 64'd0000000; // ***Changed to 6ms period
+end
+//Limits PWM output to range of 1ms to 2ms = useful range
+assign RInput = (Input < 64'd100_000)? 64'd100_000:((Input > 64'd200_000)? 64'd200_000:Input);
+always@(*) begin
+if(RInput > Count) PWM_Pulse = 1;
+else PWM_Pulse = 0;
+end
+endmodule
+// ***************************************************************
+module SSEG (seg,disp,clk100,BCD,PWM);
+input wire clk100;
+input wire [31:0] BCD;
+input wire [15:0] PWM;
+output reg [7:0]seg;
+output reg [7:0] disp;
+reg [3:0] Location = 0;
+reg[3:0] Digit;
+
+initial begin
+    seg = 8'b00000000;
+    disp = 8'b00000000;
+    Location = 0;
+    Digit = 0;
+end
+wire Clk_Multi;
+CLK100MHZ_divider IN432476(clk100, Clk_Multi);
+always@(*) begin
+    if(Digit == 4'b0000) seg[6:0] = 7'b1000000; // Make 0 with LEDs
+    if(Digit == 4'b0001) seg[6:0] = 7'b1001111; // Make 1 with LEDs
+    if(Digit == 4'b0010) seg[6:0] = 7'b0100100; // Make 2 with LEDs
+    if(Digit == 4'b0011) seg[6:0] = 7'b0110000; // Make 3 with LEDs
+    if(Digit == 4'b0100) seg[6:0] = 7'b0011001; // Make 4 with LEDs
+    if(Digit == 4'b0101) seg[6:0] = 7'b0010010; // Make 5 with LEDs
+    if(Digit == 4'b0110) seg[6:0] = 7'b0000010; // Make 6 with LEDs
+    if(Digit == 4'b0111) seg[6:0] = 7'b1111000; // Make 7 with LEDs
+    if(Digit == 4'b1000) seg[6:0] = 7'b0000000; // Make 8 with LEDs
+    if(Digit == 4'b1001) seg[6:0] = 7'b0011000; // Make 9 with LEDs
+    if(Digit == 4'b1010) seg[6:0] = 7'b0001000; // Make A with LEDs
+    if(Digit == 4'b1011) seg[6:0] = 7'b0000011; // Make b with LEDs
+    if(Digit == 4'b1100) seg[6:0] = 7'b1000110; // Make C with LEDs
+    if(Digit == 4'b1101) seg[6:0] = 7'b0100001; // Make d with LEDs
+    if(Digit == 4'b1110) seg[6:0] = 7'b0000110; // Make E with LEDs
+    if(Digit == 4'b1111) seg[6:0] = 7'b0001110; // Make F with LEDs
+end
+
+always@(posedge Clk_Multi) begin
+    Location <= Location + 1;
+    case(Location)
+        0: begin
+            disp <= 8'b11111110;
+            {seg[7],Digit} <= {1'b1,BCD[7:4]};
+        end
+        1: begin
+            disp <= 8'b11111101;
+            {seg[7],Digit} <= {1'b1,BCD[11:8]};
+        end
+        2: begin
+            disp <= 8'b11111011;
+            {seg[7],Digit} <= {1'b1,BCD[15:12]};
+        end
+        3: begin
+            disp <= 8'b11110111;
+            {seg[7],Digit} <= {1'b1,BCD[19:16]};
+        end
+        4: begin
+            disp <= 8'b11101111;
+            {seg[7],Digit} <= {1'b1,PWM[03:00]};
+        end
+        5: begin
+            disp <= 8'b11011111;
+            {seg[7],Digit} <= {1'b1,PWM[07:04]};
+        end
+        6: begin
+            disp <= 8'b10111111;
+            {seg[7],Digit} <= {1'b1,PWM[11:08]};
+        end
+        7: begin
+            disp <= 8'b01111111;
+            {seg[7],Digit} <= {1'b1,PWM[15:12]};
+            Location <= 0;
+        end
+    endcase
+end
+endmodule
+// ************************************************************************
+module CLK100MHZ_divider(clk100, New_Clock);//New_Clock = 100M/10,000 = 10KHz
+input wire clk100; // Input clock signal
+output reg New_Clock; // Divided clock output
+reg [31:0] count = 32'b00000000; // [31:0] is large enough to hold any value
+
+initial begin
+    New_Clock = 0;
+    count = 0;
+end
+
+always @(posedge clk100) begin
+    count <= count + 1; // Increment count
+    if (count == 31'd10000) begin
+        New_Clock <= ~New_Clock; // Toggle New Clock
+        count <= 31'b0; // Reset count
+    end
+end
+
+endmodule
+// ***********************************************************
